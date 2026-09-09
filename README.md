@@ -1,4 +1,4 @@
-# Pix-Autoware MCP Server
+# Autoware MCP Server
 
 Autoware 自动驾驶诊断 MCP 服务器，用于分析本地 MCAP 录音文件，排查感知、规划控制、底盘、定位等问题。
 
