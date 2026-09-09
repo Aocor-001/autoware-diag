@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "autoware-diag": {
+      "command": "python3",
+      "args": ["/Users/zyy/Desktop/Pix-autoware/Pix-Autoware/server.py"]
+    }
+  }
+}
