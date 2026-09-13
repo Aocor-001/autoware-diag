@@ -39,6 +39,10 @@ Autoware 自动驾驶诊断 MCP 服务器，用于分析本地 MCAP 录音文件
 - **低频率检测**: 识别发布频率异常低的话题
 - **低覆盖率检测**: 计算数据的间隙覆盖率
 
+### 已知噪音过滤
+
+- `socket_can1_receiver` 的 `can1 - CAN Receive Timeout`：实车未使用 can1，`analyze_rosout` / `investigate_incident` 会自动过滤，仅在 `noise_filtered` 计数。
+
 ## 安装
 
 ```bash
