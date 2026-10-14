@@ -10,9 +10,11 @@ from .core import (
     _build_anomalies,
     _cap_timeline,
     _collect_topic_data,
+    _collect_topic_data_full,
     _dictify,
     _format_stats,
     _freq_analysis,
+    _get_per_topic_messages,
     _open_mcap,
     _read_topic_timestamps,
     _require_file_path,
@@ -27,10 +29,12 @@ from .parsers import (
     _AEB_SENSITIVITY_LABELS,
     _AEB_STATUS_LABELS,
     _CONTROL_MODE_LABELS,
+    _GEAR_CMD_LABELS,
     _extract_control_summary,
     _extract_engage,
     _extract_gate_mode,
     _extract_scenario_summary,
+    _is_tl_group_topic,
     _labelize,
     _parse_aeb_obstacle_debug,
     _parse_aeb_shadow,
@@ -39,6 +43,8 @@ from .parsers import (
     _parse_pix_drive_cmd,
     _parse_pix_drive_fb,
     _parse_pix_steer_fb,
+    _parse_traffic_light_message,
+    _primary_tl_color,
     _group_has_data,
     _val,
 )
@@ -52,6 +58,9 @@ from .topics import (
     TOPIC_PERCEPTION,
     TOPIC_PLANNING_CONTROL,
     TOPIC_PLANNING_TRAJECTORY,
+    TOPIC_TAKEOVER,
+    TOPIC_TRAFFIC_LIGHT,
+    TOPIC_TRAFFIC_LIGHT_FINAL,
 )
 
 def analyze_mcap_file(args: Dict) -> Dict:
@@ -724,6 +733,411 @@ def analyze_planning_control(args: Dict) -> Dict:
                         "planning_validator": pv_parsed,
                         "anomalies": anomalies,
                         "total_anomalies": len(anomalies),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                ),
+            }
+        ],
+    }
+
+
+def _tl_color_flicker_events(timeline: List[Dict]) -> List[Dict]:
+    """Detect RED→UNKNOWN / GREEN↔UNKNOWN / color jumps on a single topic timeline."""
+    events: List[Dict] = []
+    prev = None
+    for item in timeline:
+        color = item.get("color")
+        if color is None:
+            prev = color
+            continue
+        if prev is not None and color != prev:
+            severity = "info"
+            etype = "color_change"
+            if prev in ("RED", "AMBER", "GREEN") and color in ("UNKNOWN", "UNSET"):
+                etype = "color_lost_to_unknown"
+                severity = "warning"
+            elif prev in ("UNKNOWN", "UNSET") and color == "GREEN":
+                etype = "green_recovered"
+                severity = "info"
+            elif prev == "RED" and color == "GREEN":
+                etype = "red_to_green"
+                severity = "info"
+            elif color == "UNKNOWN" or color == "UNSET":
+                etype = "to_unknown"
+                severity = "warning"
+            events.append(
+                {
+                    "time": item.get("time"),
+                    "from": prev,
+                    "to": color,
+                    "type": etype,
+                    "severity": severity,
+                    "confidence": item.get("confidence"),
+                }
+            )
+        prev = color
+    return events
+
+
+def _summarize_tl_topic_timeline(msgs: List[Dict], topic: str) -> Dict[str, Any]:
+    """Build a compact color timeline from collected TL messages."""
+    prefer_group = _is_tl_group_topic(topic)
+    timeline: List[Dict] = []
+    parse_errors = 0
+    color_counts: Dict[str, int] = {}
+    last_state = None
+    for m in msgs:
+        raw = m["data"]
+        parsed = _parse_traffic_light_message(raw, prefer_group=prefer_group)
+        if parsed is None:
+            parse_errors += 1
+            continue
+        color = _primary_tl_color(parsed)
+        if color is None:
+            color = "EMPTY"
+        color_counts[color] = color_counts.get(color, 0) + 1
+        conf = None
+        elements: List[Dict] = []
+        for sig in parsed.get("signals") or []:
+            elements.extend(sig.get("elements") or [])
+        for g in parsed.get("groups") or []:
+            elements.extend(g.get("elements") or [])
+        if elements:
+            confs = [e.get("confidence") for e in elements if e.get("confidence") is not None]
+            conf = max(confs) if confs else None
+            primary = next(
+                (e for e in elements if e.get("color_label") not in (None, "UNKNOWN", "UNSET")),
+                elements[0],
+            )
+        else:
+            primary = None
+        t = _time_str(m["log_time_ns"])
+        if last_state is None or last_state[0] != color:
+            timeline.append(
+                {
+                    "time": t,
+                    "log_time_ns": m["log_time_ns"],
+                    "color": color,
+                    "confidence": conf,
+                    "shape": (primary or {}).get("shape_label"),
+                    "status": (primary or {}).get("status_label"),
+                    "decode": parsed.get("decode"),
+                }
+            )
+            last_state = (color, conf)
+        elif last_state[1] is None and conf is not None:
+            last_state = (color, conf)
+    events = _tl_color_flicker_events(timeline)
+    green_segments: List[Dict] = []
+    seg_start = None
+    for item in timeline + [{"color": None, "time": None, "log_time_ns": None}]:
+        c = item.get("color")
+        if c == "GREEN":
+            if seg_start is None:
+                seg_start = item
+        else:
+            if seg_start is not None and item.get("log_time_ns") is not None:
+                dur_ms = (item["log_time_ns"] - seg_start["log_time_ns"]) / 1e6
+                green_segments.append(
+                    {
+                        "start": seg_start.get("time"),
+                        "end": item.get("time"),
+                        "duration_ms": round(dur_ms, 1),
+                    }
+                )
+            elif seg_start is not None and item.get("color") is None:
+                green_segments.append(
+                    {
+                        "start": seg_start.get("time"),
+                        "end": timeline[-1].get("time") if timeline else None,
+                        "duration_ms": None,
+                        "note": "green until end of bag",
+                    }
+                )
+            seg_start = None
+    return {
+        "total_messages": len(msgs),
+        "parse_errors": parse_errors,
+        "color_counts": color_counts,
+        "timeline": _cap_timeline(timeline, limit=80),
+        "color_events": _cap_timeline(events, limit=60),
+        "green_segments": green_segments[:20],
+        "last_color": timeline[-1]["color"] if timeline else None,
+    }
+
+
+def analyze_traffic_light(args: Dict) -> Dict:
+    """红绿灯链路分析：分类输出 + 组消息灯态 + 精检测失败 + 接管上下文。
+
+    排查「红灯转绿后车辆不走」时，必须把灯态时间线和控制权
+    （control_mode / engage / Takeover 日志）对齐，避免把人工接管误判为
+    「感知绿灯后 AUTO 未放行」。
+    """
+    file_path = _require_file_path(args)
+
+    timestamps = _read_topic_timestamps(file_path, TOPIC_TRAFFIC_LIGHT)
+    freq_results = {}
+    expected_freqs = {
+        "/perception/traffic_light_recognition/front_3mm/classification/car/traffic_signals": 5,
+        "/perception/traffic_light_recognition/traffic_signals": 5,
+        "/perception/traffic_light_recognition/judged/traffic_signals": 5,
+        "/perception/traffic_light_recognition/internal/traffic_signals": 5,
+        "/perception/traffic_light_recognition/front_3mm/detection/expect/rois": 30,
+        "/perception/traffic_light_recognition/front_3mm/detection/rough/rois": 30,
+        "/perception/traffic_light_recognition/front_3mm/detection/rois": 5,
+    }
+    for topic in TOPIC_TRAFFIC_LIGHT:
+        ts = timestamps.get(topic, [])
+        freq_results[topic] = _freq_analysis(ts, expected_freqs.get(topic))
+
+    signal_topics = [t for t in TOPIC_TRAFFIC_LIGHT if t.endswith("traffic_signals")]
+    content = _collect_topic_data_full(file_path, signal_topics)
+
+    topic_summaries = {}
+    for topic in signal_topics:
+        msgs = content.get(topic, [])
+        if not msgs:
+            topic_summaries[topic] = {"note": "no data"}
+            continue
+        topic_summaries[topic] = _summarize_tl_topic_timeline(msgs, topic)
+
+    tl_detector_events: List[Dict] = []
+    takeover_events: List[Dict] = []
+    for topic, decoded, pub_ns, log_ns in _get_per_topic_messages(
+        file_path, ["/rosout"], max_per_topic=0
+    ):
+        name = str(getattr(decoded, "name", "") or "")
+        msg = str(getattr(decoded, "msg", "") or "")
+        level = getattr(decoded, "level", None)
+        t = _time_str(log_ns)
+        if "traffic_light" in name or "TL_FINE" in msg or "TL_YOLOX" in msg or "TL_CLASSIFIER" in msg:
+            if "NO_MATCH" in msg or "EMPTY_OUTPUT" in msg or "zero_sized" in msg:
+                tl_detector_events.append(
+                    {
+                        "time": t,
+                        "log_time_ns": log_ns,
+                        "level": level,
+                        "node": name,
+                        "kind": "fine_detector_empty",
+                        "message": msg[:400],
+                    }
+                )
+            elif "TL_YOLOX" in msg and "output_objects=0" in msg:
+                tl_detector_events.append(
+                    {
+                        "time": t,
+                        "log_time_ns": log_ns,
+                        "level": level,
+                        "node": name,
+                        "kind": "yolox_zero_objects",
+                        "message": msg[:400],
+                    }
+                )
+        low = msg.lower()
+        if (
+            "takeover" in low
+            or "接管" in msg
+            or ("teleop" in low and "event" in low)
+            or ("brake" in low and "takeover" in low)
+        ):
+            takeover_events.append(
+                {
+                    "time": t,
+                    "log_time_ns": log_ns,
+                    "level": level,
+                    "node": name,
+                    "kind": "rosout_takeover",
+                    "message": msg[:300],
+                }
+            )
+
+    tk_content = _collect_topic_data_full(
+        file_path,
+        [
+            "/vehicle/status/control_mode",
+            "/api/autoware/get/engage",
+            "/control/command/gear_cmd",
+        ],
+    )
+    control_mode_timeline: List[Dict] = []
+    prev_mode = None
+    for m in tk_content.get("/vehicle/status/control_mode", []):
+        mode = _val(m["data"], "mode")
+        if mode is None and isinstance(m["data"], dict):
+            mode = m["data"].get("mode")
+        try:
+            mode = int(mode)
+        except (TypeError, ValueError):
+            mode = None
+        label = _CONTROL_MODE_LABELS.get(mode, str(mode)) if mode is not None else None
+        if mode != prev_mode:
+            control_mode_timeline.append(
+                {"time": _time_str(m["log_time_ns"]), "mode": mode, "label": label}
+            )
+            prev_mode = mode
+
+    gear_timeline: List[Dict] = []
+    prev_gear = None
+    for m in tk_content.get("/control/command/gear_cmd", []):
+        g = _val(m["data"], "command", "data")
+        try:
+            g = int(g)
+        except (TypeError, ValueError):
+            g = None
+        if g != prev_gear:
+            gear_timeline.append(
+                {
+                    "time": _time_str(m["log_time_ns"]),
+                    "gear": g,
+                    "label": _GEAR_CMD_LABELS.get(g, str(g)),
+                }
+            )
+            prev_gear = g
+
+    engage_timeline: List[Dict] = []
+    prev_eng = None
+    for m in tk_content.get("/api/autoware/get/engage", []):
+        eng = _extract_engage(m["data"])
+        if eng != prev_eng:
+            engage_timeline.append({"time": _time_str(m["log_time_ns"]), "engage": eng})
+            prev_eng = eng
+
+    anomalies: List[Dict] = []
+    for topic, freq in freq_results.items():
+        if freq.get("count", 0) == 0 and topic in (
+            TOPIC_TRAFFIC_LIGHT_FINAL,
+            "/perception/traffic_light_recognition/front_3mm/classification/car/traffic_signals",
+        ):
+            anomalies.append(
+                {
+                    "topic": topic,
+                    "type": "missing_topic",
+                    "severity": "error",
+                    "detail": f"Critical TL topic has no messages: {topic}",
+                }
+            )
+        elif freq.get("count", 0) == 0:
+            anomalies.append(
+                {
+                    "topic": topic,
+                    "type": "missing_topic",
+                    "severity": "warning",
+                    "detail": f"Topic {topic} has no messages",
+                }
+            )
+        elif not freq.get("healthy", True):
+            anomalies.append(
+                {
+                    "topic": topic,
+                    "type": "frequency_anomaly",
+                    "severity": "warning",
+                    "detail": (
+                        f"{topic}: expected {freq.get('expected_frequency_hz','?')} Hz, "
+                        f"got {freq.get('actual_frequency_hz','?')} Hz"
+                    ),
+                }
+            )
+
+    final = topic_summaries.get(TOPIC_TRAFFIC_LIGHT_FINAL, {})
+    if final.get("color_counts"):
+        unk = final["color_counts"].get("UNKNOWN", 0) + final["color_counts"].get("UNSET", 0)
+        total = sum(final["color_counts"].values()) or 1
+        if unk / total > 0.3:
+            anomalies.append(
+                {
+                    "topic": TOPIC_TRAFFIC_LIGHT_FINAL,
+                    "type": "high_unknown_ratio",
+                    "severity": "warning",
+                    "detail": (
+                        f"final traffic_signals UNKNOWN/UNSET ratio "
+                        f"{unk}/{total} ({100 * unk / total:.0f}%) — 规划可能一直按未知灯态压停"
+                    ),
+                }
+            )
+    for ev in final.get("color_events") or []:
+        if ev.get("type") in ("color_lost_to_unknown", "to_unknown"):
+            anomalies.append(
+                {
+                    "topic": TOPIC_TRAFFIC_LIGHT_FINAL,
+                    "type": ev["type"],
+                    "severity": "warning",
+                    "detail": f"灯态 {ev.get('from')}→{ev.get('to')} @ {ev.get('time')}",
+                }
+            )
+            break
+
+    if tl_detector_events:
+        anomalies.append(
+            {
+                "topic": "/rosout",
+                "type": "tl_fine_detector_empty",
+                "severity": "warning",
+                "detail": (
+                    f"{len(tl_detector_events)} fine-detector empty/NO_MATCH events; "
+                    f"first={tl_detector_events[0].get('time')} "
+                    f"last={tl_detector_events[-1].get('time')}"
+                ),
+            }
+        )
+
+    left_autonomous = [
+        e
+        for e in control_mode_timeline
+        if e.get("label") in ("MANUAL", "DISENGAGED") or e.get("mode") in (4, 5)
+    ]
+    entered_autonomous = [
+        e
+        for e in control_mode_timeline
+        if e.get("mode") == 1
+        or (e.get("label") or "").startswith("AUTONOMOUS")
+    ]
+
+    from .core import _decoding_status
+
+    guidance = [
+        "灯态时间线在 topic_summaries[/.../traffic_signals]；color_events 标了 RED→UNKNOWN / GREEN 闪烁。",
+        "若 final 灯态长时间 UNKNOWN，规划会按未知压停——不要只看 BEV。",
+        "control_mode 1→4 或 rosout Takeover 说明是人工接管后起步，不是 AUTO 放行。",
+        "绿灯首次出现时间 vs 车速开始上升时间：车速更早升高 → 多半是接管起步。",
+    ]
+
+    return {
+        "content": [
+            {
+                "type": "text",
+                "text": json.dumps(
+                    {
+                        "file_path": file_path,
+                        "ros2_decoding": _decoding_status(),
+                        "semantics": {
+                            "final_topic": TOPIC_TRAFFIC_LIGHT_FINAL,
+                            "tier4_colors": "RED=1 AMBER=2 GREEN=3 (UNKNOWN=18 in tier4)",
+                            "autoware_colors": "UNKNOWN=0 RED=1 AMBER=2 GREEN=3",
+                            "note": (
+                                "tier4 分类链与 autoware 组消息常量不同；"
+                                "tier4 schema 为 ros2idl，解码失败时用 CDR fallback"
+                            ),
+                        },
+                        "frequency_analysis": freq_results,
+                        "topic_summaries": topic_summaries,
+                        "tl_detector_events": _cap_timeline(tl_detector_events, limit=40),
+                        "control_mode_timeline": control_mode_timeline,
+                        "engage_timeline": engage_timeline,
+                        "gear_timeline": _cap_timeline(gear_timeline, limit=30),
+                        "takeover_events": _cap_timeline(takeover_events, limit=20),
+                        "takeover_summary": {
+                            "entered_autonomous_times": [e["time"] for e in entered_autonomous[:10]],
+                            "left_autonomous_times": [e["time"] for e in left_autonomous[:10]],
+                            "note": (
+                                "left_autonomous 之后的车速上升应解释为人工/遥控起步，"
+                                "不能归因于「感知绿灯后 AUTO 未响应」"
+                            ),
+                        },
+                        "anomalies": anomalies,
+                        "total_anomalies": len(anomalies),
+                        "diagnosis_guidance": guidance,
                     },
                     ensure_ascii=False,
                     indent=2,

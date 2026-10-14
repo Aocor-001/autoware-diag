@@ -1,4 +1,0 @@
-{
-  "displayName": "Autoware Diagnostics",
-  "brief": "Analyze MCAP logs with autoware-diag MCP: perception, planning/control, chassis, MRM, AEB"
-}

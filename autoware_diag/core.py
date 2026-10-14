@@ -10,7 +10,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .log import log
 from .mcap_support import HAVE_MCAP, HAVE_ROS2, Ros2DecoderFactory, make_reader
-from .mcp import INTERNAL_ERROR, INVALID_PARAMS, MAX_RESPONSE_CHARS, McpError, _truncate_text
+from .errors import INTERNAL_ERROR, INVALID_PARAMS, MAX_RESPONSE_CHARS, AnalysisError, _truncate_text
 
 def _open_mcap(file_path: str):
     """Open an MCAP file and return (reader, file_object).
@@ -19,19 +19,19 @@ def _open_mcap(file_path: str):
     文件以流式方式读取，不会整文件加载进内存。
     """
     if not HAVE_MCAP:
-        raise McpError(INTERNAL_ERROR, "mcap library not installed (pip install mcap)")
+        raise AnalysisError(INTERNAL_ERROR, "mcap library not installed (pip install mcap)")
     if not os.path.isfile(file_path):
-        raise McpError(INVALID_PARAMS, f"File not found: {file_path}")
+        raise AnalysisError(INVALID_PARAMS, f"File not found: {file_path}")
     file_size = os.path.getsize(file_path)
     if file_size == 0:
-        raise McpError(INVALID_PARAMS, f"File is empty: {file_path}")
+        raise AnalysisError(INVALID_PARAMS, f"File is empty: {file_path}")
     f = None
     try:
         f = open(file_path, "rb")
         decoder_factories = [Ros2DecoderFactory()] if HAVE_ROS2 else []
         reader = make_reader(f, decoder_factories=decoder_factories)
         return reader, f
-    except McpError:
+    except AnalysisError:
         if f is not None:
             f.close()
         raise
@@ -39,16 +39,16 @@ def _open_mcap(file_path: str):
         if f is not None:
             f.close()
         log.error("Failed to open MCAP file %s: %s", file_path, traceback.format_exc())
-        raise McpError(INTERNAL_ERROR, f"Failed to read MCAP file: {e}")
+        raise AnalysisError(INTERNAL_ERROR, f"Failed to read MCAP file: {e}")
 
 
 def _require_file_path(args: Dict) -> str:
     """Validate and return the file_path argument (clean error instead of KeyError)."""
     fp = args.get("file_path")
     if not fp or not isinstance(fp, str):
-        raise McpError(INVALID_PARAMS, "Missing required parameter: file_path (string)")
+        raise AnalysisError(INVALID_PARAMS, "Missing required parameter: file_path (string)")
     if not os.path.isfile(fp):
-        raise McpError(INVALID_PARAMS, f"File not found: {fp}")
+        raise AnalysisError(INVALID_PARAMS, f"File not found: {fp}")
     return fp
 
 

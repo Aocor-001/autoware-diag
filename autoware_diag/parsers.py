@@ -462,3 +462,353 @@ def _reduce_trajectory(d: Any) -> Any:
 
 _DIAG_LEVEL_LABELS = {0: "OK", 1: "WARN", 2: "ERROR", 3: "STALE"}
 
+# ---------------------------------------------------------------------------
+# 红绿灯 — 两套常量表（tier4 分类链 vs autoware 组消息），不可混用
+# ---------------------------------------------------------------------------
+
+# tier4_perception_msgs/TrafficLightElement（car/ped 分类链输出）
+# IDL: RED=1 AMBER=2 GREEN=3 WHITE=4 … UNKNOWN=18（与 autoware 的 UNKNOWN=0 不同）
+_TL_T4_COLOR = {
+    0: "UNKNOWN", 1: "RED", 2: "AMBER", 3: "GREEN", 4: "WHITE", 18: "UNKNOWN",
+}
+_TL_T4_SHAPE = {
+    5: "CIRCLE", 6: "LEFT_ARROW", 7: "RIGHT_ARROW", 8: "UP_ARROW",
+    9: "UP_LEFT_ARROW", 10: "UP_RIGHT_ARROW", 11: "DOWN_ARROW",
+    12: "DOWN_LEFT_ARROW", 13: "DOWN_RIGHT_ARROW", 14: "CROSS",
+    15: "SOLID_OFF", 16: "SOLID_ON", 17: "FLASHING", 18: "UNKNOWN",
+}
+_TL_T4_STATUS = {0: "UNLIT", 1: "LIT", 2: "BLINK"}
+
+# autoware_perception_msgs/TrafficLightElement（internal/judged/final）
+_TL_AW_COLOR = {0: "UNKNOWN", 1: "RED", 2: "AMBER", 3: "GREEN", 4: "WHITE"}
+_TL_AW_SHAPE = {
+    1: "CIRCLE", 2: "LEFT_ARROW", 3: "RIGHT_ARROW", 4: "UP_ARROW",
+    5: "UP_LEFT_ARROW", 6: "UP_RIGHT_ARROW", 7: "DOWN_ARROW",
+    8: "DOWN_LEFT_ARROW", 9: "DOWN_RIGHT_ARROW", 10: "CROSS",
+}
+_TL_AW_STATUS = {0: "UNSET", 1: "SOLID_OFF", 2: "SOLID_ON", 3: "FLASHING"}
+
+
+class _CdrReader:
+    """Minimal little-endian CDR reader for TrafficLight messages.
+
+    tier4 TrafficLightArray 的 schema 是 ros2idl，mcap-ros2-support 的
+    DecoderFactory 只认 ros2msg，解码会返回 None。这里按 IDL 布局手工解，
+    避免红绿灯链路在工具里变成「无数据」假阴性。
+    """
+
+    def __init__(self, data: bytes):
+        self.b = data
+        self.o = 4  # skip encapsulation header
+
+    def _align(self, n: int) -> None:
+        while (self.o - 4) % n:
+            self.o += 1
+
+    def u8(self) -> int:
+        v = self.b[self.o]
+        self.o += 1
+        return v
+
+    def i32(self) -> int:
+        self._align(4)
+        v = int.from_bytes(self.b[self.o:self.o + 4], "little", signed=True)
+        self.o += 4
+        return v
+
+    def u32(self) -> int:
+        self._align(4)
+        v = int.from_bytes(self.b[self.o:self.o + 4], "little", signed=False)
+        self.o += 4
+        return v
+
+    def i64(self) -> int:
+        self._align(8)
+        v = int.from_bytes(self.b[self.o:self.o + 8], "little", signed=True)
+        self.o += 8
+        return v
+
+    def f32(self) -> float:
+        self._align(4)
+        import struct
+        v = struct.unpack_from("<f", self.b, self.o)[0]
+        self.o += 4
+        return v
+
+    def f64(self) -> float:
+        self._align(8)
+        import struct
+        v = struct.unpack_from("<d", self.b, self.o)[0]
+        self.o += 8
+        return v
+
+    def string(self) -> str:
+        n = self.u32()
+        if n <= 0:
+            return ""
+        s = self.b[self.o:self.o + n - 1].decode("utf-8", "replace")
+        self.o += n
+        return s
+
+    def time(self) -> Dict[str, int]:
+        return {"sec": self.i32(), "nanosec": self.u32()}
+
+
+def _tl_element_summary(color: int, shape: int, status: int, conf: float,
+                        family: str) -> Dict[str, Any]:
+    if family == "tier4":
+        cmap, smap, stmap = _TL_T4_COLOR, _TL_T4_SHAPE, _TL_T4_STATUS
+    else:
+        cmap, smap, stmap = _TL_AW_COLOR, _TL_AW_SHAPE, _TL_AW_STATUS
+    return {
+        "color": color,
+        "color_label": cmap.get(color, str(color)),
+        "shape": shape,
+        "shape_label": smap.get(shape, str(shape)),
+        "status": status,
+        "status_label": stmap.get(status, str(status)),
+        "confidence": None if conf is None else round(float(conf), 4),
+    }
+
+
+def _parse_tl_array_decoded(d: Any) -> Optional[Dict[str, Any]]:
+    """Parse a decoded tier4 TrafficLightArray (ROS2 object)."""
+    signals = getattr(d, "signals", None)
+    if signals is None:
+        return None
+    out = []
+    for tl in signals:
+        tid = getattr(tl, "traffic_light_id", None)
+        ttype = getattr(tl, "traffic_light_type", None)
+        elements = []
+        for el in getattr(tl, "elements", None) or []:
+            elements.append(
+                _tl_element_summary(
+                    getattr(el, "color", None),
+                    getattr(el, "shape", None),
+                    getattr(el, "status", None),
+                    getattr(el, "confidence", None),
+                    "tier4",
+                )
+            )
+        out.append(
+            {
+                "traffic_light_id": tid,
+                "traffic_light_type": ttype,
+                "traffic_light_type_label": (
+                    "CAR" if ttype == 0 else "PEDESTRIAN" if ttype == 1 else str(ttype)
+                ),
+                "elements": elements,
+            }
+        )
+    header = getattr(d, "header", None)
+    stamp = getattr(header, "stamp", None) if header else None
+    return {
+        "signals": out,
+        "header_stamp": (
+            {"sec": getattr(stamp, "sec", None), "nanosec": getattr(stamp, "nanosec", None)}
+            if stamp is not None
+            else None
+        ),
+    }
+
+
+def _parse_tl_group_decoded(d: Any) -> Optional[Dict[str, Any]]:
+    """Parse a decoded autoware TrafficLightGroupArray (ROS2 object)."""
+    groups = getattr(d, "traffic_light_groups", None)
+    if groups is None:
+        return None
+    out = []
+    for g in groups:
+        gid = getattr(g, "traffic_light_group_id", None)
+        elements = []
+        for el in getattr(g, "elements", None) or []:
+            elements.append(
+                _tl_element_summary(
+                    getattr(el, "color", None),
+                    getattr(el, "shape", None),
+                    getattr(el, "status", None),
+                    getattr(el, "confidence", None),
+                    "aw",
+                )
+            )
+        preds = []
+        for p in getattr(g, "predictions", None) or []:
+            pels = []
+            for el in getattr(p, "simultaneous_elements", None) or []:
+                pels.append(
+                    _tl_element_summary(
+                        getattr(el, "color", None),
+                        getattr(el, "shape", None),
+                        getattr(el, "status", None),
+                        getattr(el, "confidence", None),
+                        "aw",
+                    )
+                )
+            preds.append(
+                {
+                    "reliability": getattr(p, "reliability", None),
+                    "information_source": getattr(p, "information_source", None),
+                    "elements": pels,
+                }
+            )
+        out.append(
+            {
+                "traffic_light_group_id": gid,
+                "elements": elements,
+                "predictions": preds or None,
+            }
+        )
+    return {"groups": out}
+
+
+def _parse_tl_array_cdr(data: bytes) -> Optional[Dict[str, Any]]:
+    """Fallback CDR decode for tier4 TrafficLightArray (ros2idl)."""
+    try:
+        c = _CdrReader(data)
+        stamp = c.time()
+        c.string()  # frame_id
+        n = c.u32()
+        signals = []
+        for _ in range(n):
+            tid = c.i64()
+            ttype = c.u8()
+            ne = c.u32()
+            elements = []
+            for _e in range(ne):
+                color = c.u8()
+                shape = c.u8()
+                status = c.u8()
+                conf = c.f64()
+                elements.append(
+                    _tl_element_summary(color, shape, status, conf, "tier4")
+                )
+            signals.append(
+                {
+                    "traffic_light_id": tid,
+                    "traffic_light_type": ttype,
+                    "traffic_light_type_label": (
+                        "CAR" if ttype == 0 else "PEDESTRIAN" if ttype == 1 else str(ttype)
+                    ),
+                    "elements": elements,
+                }
+            )
+        return {"signals": signals, "header_stamp": stamp, "decode": "cdr_fallback"}
+    except Exception:
+        return None
+
+
+def _parse_tl_group_cdr(data: bytes) -> Optional[Dict[str, Any]]:
+    """Fallback CDR decode for autoware TrafficLightGroupArray (ros2msg).
+
+    Layout: Time stamp; sequence<TrafficLightGroup>
+      TrafficLightGroup: int64 id; sequence<TrafficLightElement> elements;
+                         sequence<PredictedTrafficLightState> predictions
+      TrafficLightElement: u8 color, u8 shape, u8 status, f32 confidence
+      PredictedTrafficLightState: Time predicted_stamp;
+        sequence<Tele> simultaneous_elements; f32 reliability; string information_source
+    """
+    try:
+        c = _CdrReader(data)
+        c.time()  # stamp
+        ng = c.u32()
+        groups = []
+        for _ in range(ng):
+            gid = c.i64()
+            ne = c.u32()
+            elements = []
+            for _e in range(ne):
+                color = c.u8()
+                shape = c.u8()
+                status = c.u8()
+                conf = c.f32()
+                elements.append(
+                    _tl_element_summary(color, shape, status, conf, "aw")
+                )
+            npred = c.u32()
+            preds = []
+            for _p in range(npred):
+                c.time()
+                nse = c.u32()
+                pels = []
+                for _se in range(nse):
+                    color = c.u8()
+                    shape = c.u8()
+                    status = c.u8()
+                    conf = c.f32()
+                    pels.append(
+                        _tl_element_summary(color, shape, status, conf, "aw")
+                    )
+                rel = c.f32()
+                src = c.string()
+                preds.append(
+                    {
+                        "reliability": rel,
+                        "information_source": src,
+                        "elements": pels,
+                    }
+                )
+            groups.append(
+                {
+                    "traffic_light_group_id": gid,
+                    "elements": elements,
+                    "predictions": preds or None,
+                }
+            )
+        return {"groups": groups, "decode": "cdr_fallback"}
+    except Exception:
+        return None
+
+
+def _parse_traffic_light_message(
+    data: Any, prefer_group: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Unified TL parse: try ROS2 object first, fall back to CDR bytes."""
+    # Decoded ROS2 object
+    if hasattr(data, "signals") or hasattr(data, "traffic_light_groups"):
+        if hasattr(data, "traffic_light_groups"):
+            return _parse_tl_group_decoded(data) or {
+                "note": "decoded object missing traffic_light_groups"
+            }
+        return _parse_tl_array_decoded(data) or {
+            "note": "decoded object missing signals"
+        }
+    # Raw bytes → CDR fallback
+    if isinstance(data, (bytes, bytearray)):
+        if prefer_group:
+            return _parse_tl_group_cdr(data) or _parse_tl_array_cdr(data)
+        return _parse_tl_array_cdr(data) or _parse_tl_group_cdr(data)
+    if isinstance(data, dict):
+        # already dictified
+        return data
+    return None
+
+
+def _primary_tl_color(parsed: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Extract a single dominant color label from a parsed TL message."""
+    if not parsed:
+        return None
+    elements: List[Dict[str, Any]] = []
+    for sig in parsed.get("signals") or []:
+        elements.extend(sig.get("elements") or [])
+    for g in parsed.get("groups") or []:
+        elements.extend(g.get("elements") or [])
+    if not elements:
+        return None
+    # 优先取非 UNKNOWN；否则返回第一个
+    for el in elements:
+        if el.get("color_label") not in (None, "UNKNOWN", "UNSET"):
+            return el.get("color_label")
+    return elements[0].get("color_label")
+
+
+def _is_tl_group_topic(topic: str) -> bool:
+    return any(
+        topic.endswith(s)
+        for s in (
+            "/internal/traffic_signals",
+            "/judged/traffic_signals",
+            "/traffic_signals",
+        )
+    ) and "front_3mm" not in topic
+

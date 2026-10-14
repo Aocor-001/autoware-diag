@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 from .core import _dictify, _open_mcap, _require_file_path, _truncate_text
 from .mcap_support import HAVE_ROS2
-from .mcp import INTERNAL_ERROR, McpError
+from .errors import INTERNAL_ERROR, AnalysisError
 from .parsers import CUSTOM_MESSAGE_CATALOG
 
 def describe_message_schema(args: Dict) -> Dict:
@@ -17,7 +17,7 @@ def describe_message_schema(args: Dict) -> Dict:
     if include_text is None:
         include_text = True
     if not topic and not schema_name:
-        raise McpError(
+        raise AnalysisError(
             INVALID_PARAMS, "Provide topic or schema_name"
         )
 
@@ -27,7 +27,7 @@ def describe_message_schema(args: Dict) -> Dict:
     finally:
         fp.close()
     if not summary:
-        raise McpError(INTERNAL_ERROR, "No summary section in MCAP")
+        raise AnalysisError(INTERNAL_ERROR, "No summary section in MCAP")
 
     # Resolve schema
     matched_schemas = []
@@ -45,7 +45,7 @@ def describe_message_schema(args: Dict) -> Dict:
                     matched_schemas.append(sch)
                 break
         if topic_info is None:
-            raise McpError(INVALID_PARAMS, f"Topic not found in MCAP: {topic}")
+            raise AnalysisError(INVALID_PARAMS, f"Topic not found in MCAP: {topic}")
     else:
         for sch in summary.schemas.values():
             if sch.name == schema_name or sch.name.endswith("/" + schema_name):
@@ -130,7 +130,7 @@ def list_custom_messages(args: Dict) -> Dict:
     finally:
         fp.close()
     if not summary:
-        raise McpError(INTERNAL_ERROR, "No summary section in MCAP")
+        raise AnalysisError(INTERNAL_ERROR, "No summary section in MCAP")
 
     def _is_custom(name: str) -> bool:
         n = (name or "").lower()

@@ -1,0 +1,4 @@
+{
+  "displayName": "Autoware 诊断",
+  "brief": "用本地 autoware-diag CLI 分析 MCAP 录音：感知/红绿灯/规划控制/底盘/MRM/AEB 排查"
+}

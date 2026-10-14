@@ -1,4 +1,0 @@
-{
-  "displayName": "Autoware 诊断",
-  "brief": "用 autoware-diag MCP 分析 MCAP 录音：感知/红绿灯/规划控制/底盘/MRM/AEB 排查"
-}

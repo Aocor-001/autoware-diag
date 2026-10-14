@@ -5,7 +5,7 @@ description: "Use when the user explicitly asks to analyze Autoware or Pix Robob
 
 # Autoware Diagnostics (MCAP)
 
-Diagnose Pix Robobus / Autoware MCAP recordings through the `autoware-diag` MCP server. Build evidence chains; do not infer a root cause from an isolated anomaly.
+Diagnose Pix Robobus / Autoware MCAP recordings with the repository's local CLI. Build evidence chains; do not infer a root cause from an isolated anomaly.
 
 ## Hard rules
 
@@ -24,7 +24,27 @@ Diagnose Pix Robobus / Autoware MCAP recordings through the `autoware-diag` MCP 
 8. **No pre-window blame.** Errors before a target range are independent unless their state is visibly continuous into that range; cite the continuous interval.
 9. **Bound incident windows.** Keep `window_seconds` at or below 30 seconds unless the user requests more.
 10. **On error, read the message.** Do not retry identical parameters.
-11. **Do not emulate unavailable MCP tools.** If MCP tools are not loaded, say so and ask for an engine restart or a new chat. Do not silently parse MCAP with shell or Python.
+11. **Use the local CLI.** From the repository root, run `cd REPO/scripts && python3 autoware_diag.py <command> <file_path>`. Do not invent a path or silently replace the project CLI with ad-hoc parsing.
+
+## CLI command map
+
+Run commands from the repository root. Each command writes structured JSON to stdout and errors to stderr with a nonzero exit code.
+
+| Intent | Command |
+|---|---|
+| Package structure | `cd REPO/scripts && python3 autoware_diag.py overview FILE` |
+| Node logs | `cd REPO/scripts && python3 autoware_diag.py rosout FILE` |
+| Diagnostics | `cd REPO/scripts && python3 autoware_diag.py diagnostics FILE` |
+| Vehicle health | `cd REPO/scripts && python3 autoware_diag.py health FILE` |
+| Gaps and frequency | `cd REPO/scripts && python3 autoware_diag.py anomalies FILE` |
+| Traffic lights | `cd REPO/scripts && python3 autoware_diag.py traffic-light FILE` |
+| Planning/control | `cd REPO/scripts && python3 autoware_diag.py planning-control FILE` |
+| Perception/chassis/localization | `perception`, `chassis`, `localization` |
+| AEB/MRM | `aeb`, `mrm` |
+| Incident window | `cd REPO/scripts && python3 autoware_diag.py incident FILE --timestamp-iso 'USER_TIME' --window-seconds 2` |
+| Topics and schemas | `topics`, `schema`, `custom-messages` |
+
+The CLI is local and does not require an MCP server or external service. Keep the JSON result as the evidence source and report command failures instead of treating them as missing recording data.
 
 ## Evidence availability gate
 
@@ -117,7 +137,7 @@ Pass user-provided values unchanged. After the call, compare its returned `time_
 
 ## Capability boundaries
 
-The current MCP tools analyze a supplied MCAP file per call. They do not currently provide a single multi-file incident-window query, a unified cross-file event timeline, or a normal-versus-abnormal comparison tool. For multiple files, map each file's actual time range separately, identify which file covers the user's time, analyze each required file explicitly, and label every source file. Do not claim continuous state across an uncovered gap or present multi-file correlation as a built-in result.
+The current local CLI analyzes a supplied MCAP file per call. It does not currently provide a single multi-file incident-window query, a unified cross-file event timeline, or a normal-versus-abnormal comparison tool. For multiple files, map each file's actual time range separately, identify which file covers the user's time, analyze each required file explicitly, and label every source file. Do not claim continuous state across an uncovered gap or present multi-file correlation as a built-in result.
 
 ## Candidate-cause review
 

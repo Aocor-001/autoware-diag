@@ -22,7 +22,7 @@ from .core import (
     _truncate_text,
 )
 from .mcap_support import HAVE_ROS2, Ros2DecoderFactory
-from .mcp import INVALID_PARAMS, MAX_RESPONSE_CHARS, McpError
+from .errors import INVALID_PARAMS, MAX_RESPONSE_CHARS, AnalysisError
 from .noise import _is_rosout_noise
 from .parsers import (
     _AUTOWARE_STATE_LABELS,
@@ -54,12 +54,12 @@ from .topics import (
 def _parse_time_value(val: Any, label: str = "time") -> int:
     """Parse a time value (Unix seconds float or ISO string) to nanoseconds."""
     if val is None:
-        raise McpError(INVALID_PARAMS, f"Missing required parameter: {label}")
+        raise AnalysisError(INVALID_PARAMS, f"Missing required parameter: {label}")
     if isinstance(val, (int, float)):
         return int(val * 1e9)
     if isinstance(val, str):
         return int(dateutil_parser.parse(val.strip()).timestamp() * 1e9)
-    raise McpError(INVALID_PARAMS, f"Cannot parse {label}={val!r} (expected Unix seconds or ISO string)")
+    raise AnalysisError(INVALID_PARAMS, f"Cannot parse {label}={val!r} (expected Unix seconds or ISO string)")
 
 
 def investigate_incident(args: Dict) -> Dict:
@@ -85,7 +85,7 @@ def investigate_incident(args: Dict) -> Dict:
             label="end/end_iso",
         )
         if ts_end_ns <= ts_start_ns:
-            raise McpError(INVALID_PARAMS, "end must be after start")
+            raise AnalysisError(INVALID_PARAMS, "end must be after start")
         ts_ns = None  # no center point
     elif is_point:
         # Single point mode
@@ -95,11 +95,11 @@ def investigate_incident(args: Dict) -> Dict:
         )
         window = args.get("window_seconds", 2.0)
         if window <= 0:
-            raise McpError(INVALID_PARAMS, "window_seconds must be positive")
+            raise AnalysisError(INVALID_PARAMS, "window_seconds must be positive")
         ts_start_ns = ts_ns - int(window * 1e9)
         ts_end_ns = ts_ns + int(window * 1e9)
     else:
-        raise McpError(
+        raise AnalysisError(
             INVALID_PARAMS,
             "Provide either timestamp/timestamp_iso (point mode) "
             "or start/end or start_iso/end_iso (range mode)",
@@ -184,7 +184,7 @@ def investigate_incident(args: Dict) -> Dict:
             })
     except Exception as e:
         log.error("investigate_incident: iter_messages failed: %s", traceback.format_exc())
-        raise McpError(INTERNAL_ERROR, f"Error reading messages from MCAP file: {e}")
+        raise AnalysisError(INTERNAL_ERROR, f"Error reading messages from MCAP file: {e}")
     finally:
         fp.close()
 
@@ -202,7 +202,7 @@ def investigate_incident(args: Dict) -> Dict:
                 f" File time range: {_time_str(file_first_log)} ~ {_time_str(file_last_log)}. "
                 f"Your window: {_time_str(ts_start_ns)} ~ {_time_str(ts_end_ns)}."
             )
-        raise McpError(
+        raise AnalysisError(
             INVALID_PARAMS,
             f"No messages found in the specified time window.{file_range_info} "
             "Check that the timestamp is within the recording's time range.",
