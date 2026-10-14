@@ -1,0 +1,4 @@
+{
+  "displayName": "Autoware Diagnostics",
+  "brief": "Analyze MCAP logs with the local autoware-diag CLI: perception, planning/control, chassis, MRM, AEB"
+}

@@ -8,6 +8,33 @@ TOPIC_PERCEPTION = [
     "/sensing/lidar/concatenated/pointcloud_cloudini",
 ]
 
+# 红绿灯识别链路（按数据流）：rough/expect ROI → fine detector → car/ped 分类
+#   → internal/judged → final traffic_signals（规划实际消费）
+# tier4 TrafficLightArray 为 ros2idl，标准 ROS2 decoder 不支持，需 CDR 兜底。
+TOPIC_TRAFFIC_LIGHT = [
+    "/perception/traffic_light_recognition/front_3mm/classification/car/traffic_signals",
+    "/perception/traffic_light_recognition/front_3mm/classification/pedestrian/traffic_signals",
+    "/perception/traffic_light_recognition/front_3mm/classification/traffic_signals",
+    "/perception/traffic_light_recognition/internal/traffic_signals",
+    "/perception/traffic_light_recognition/judged/traffic_signals",
+    "/perception/traffic_light_recognition/traffic_signals",
+    "/perception/traffic_light_recognition/front_3mm/detection/rois",
+    "/perception/traffic_light_recognition/front_3mm/detection/expect/rois",
+    "/perception/traffic_light_recognition/front_3mm/detection/rough/rois",
+]
+
+# 规划真正读的最终灯态
+TOPIC_TRAFFIC_LIGHT_FINAL = "/perception/traffic_light_recognition/traffic_signals"
+
+# 接管 / 控制权交接（红绿灯后不走时必须核对：是 AUTO 压停还是人工接管）
+TOPIC_TAKEOVER = [
+    "/vehicle/status/control_mode",
+    "/api/autoware/get/engage",
+    "/control/current_gate_mode",
+    "/control/command/gear_cmd",
+    "/system/operation_mode/state",
+]
+
 TOPIC_PLANNING_CONTROL = [
     "/control/command/control_cmd",
     "/control/command/actuation_cmd",

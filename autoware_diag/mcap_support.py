@@ -35,15 +35,35 @@ class Ros2DecoderFactory(McapDecoderFactory):
             return None
         if not schema or not schema.data:
             return None
-        schema_name = schema.name
-        schema_text = schema.data.decode("utf-8")
+        # ros2idl schemas (e.g. tier4 TrafficLightArray) are not supported by
+        # mcap-ros2 generate_dynamic; skip early to avoid stderr spam.
+        schema_encoding = getattr(schema, "encoding", None)
+        if schema_encoding and schema_encoding not in ("ros2msg", "ros2idl", ""):
+            return None
+        schema_text = schema.data.decode("utf-8", "replace")
+        if schema_encoding == "ros2idl" or schema_text.lstrip().startswith("IDL:"):
+            return None
 
+        schema_name = schema.name
         if schema_name not in self._decoders:
+            import contextlib
+            import io
+            import os
+
+            # mcap-ros2 prints "Error processing ... invalid message name"
+            # to stderr for malformed/IDL content — silence once.
             try:
-                decoders = generate_dynamic(schema_name, schema_text)
+                devnull = open(os.devnull, "w")
+                with contextlib.redirect_stderr(devnull):
+                    decoders = generate_dynamic(schema_name, schema_text)
                 self._decoders[schema_name] = decoders
             except Exception:
-                return None
+                self._decoders[schema_name] = {}
+            finally:
+                try:
+                    devnull.close()
+                except Exception:
+                    pass
 
         decoders = self._decoders.get(schema_name, {})
         return decoders.get(schema_name)
