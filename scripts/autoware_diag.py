@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from autoware_diag.cache import Cache
 from autoware_diag.core import detect_anomalies_local
 from autoware_diag.errors import AnalysisError
 from autoware_diag.events import detect_aeb_events, detect_mrm_events
@@ -32,10 +33,13 @@ from autoware_diag.modules import (
     analyze_traffic_light,
 )
 from autoware_diag.overview import analyze_bag_overview, list_topics
+from autoware_diag.quick import inspect_bag, triage_bag
 from autoware_diag.schema import describe_message_schema, list_custom_messages
 
 
 COMMANDS: Dict[str, Callable[[Dict[str, Any]], Any]] = {
+    "inspect": inspect_bag,
+    "triage": triage_bag,
     "mcap": analyze_mcap_file,
     "anomalies": detect_anomalies_local,
     "perception": analyze_perception,
@@ -68,6 +72,12 @@ def _build_parser() -> argparse.ArgumentParser:
         command = sub.add_parser(name, help=f"运行 {name} 分析")
         _add_file(command)
 
+    for name in ("inspect", "triage"):
+        sub.choices[name].add_argument("--no-cache", action="store_true", help="不读写派生缓存")
+    sub.choices["triage"].add_argument("--details", action="store_true", help="展开有界证据明细")
+    cache = sub.add_parser("cache", help="管理诊断派生缓存（不修改原始录包）")
+    cache.add_argument("action", choices=("info", "clear"))
+
     anomalies = sub.choices["anomalies"]
     anomalies.add_argument("--gap-threshold-s", type=float)
     anomalies.add_argument("--min-frequency-hz", type=float)
@@ -85,11 +95,11 @@ def _build_parser() -> argparse.ArgumentParser:
     schema.add_argument("--include-schema-text", action=argparse.BooleanOptionalAction, default=None)
 
     incident = sub.choices["incident"]
-    incident.add_argument("--timestamp", type=float)
+    incident.add_argument("--timestamp")
     incident.add_argument("--timestamp-iso")
-    incident.add_argument("--window-seconds", type=float)
-    incident.add_argument("--start", type=float)
-    incident.add_argument("--end", type=float)
+    incident.add_argument("--window-seconds")
+    incident.add_argument("--start")
+    incident.add_argument("--end")
     incident.add_argument("--start-iso")
     incident.add_argument("--end-iso")
     return parser
@@ -118,9 +128,12 @@ def _unwrap_result(result: Any) -> Any:
 def main() -> int:
     parser = _build_parser()
     namespace = parser.parse_args()
-    payload = _args_to_payload(namespace)
     try:
-        result = COMMANDS[namespace.command](payload)
+        if namespace.command == "cache":
+            cache = Cache()
+            result = cache.info() if namespace.action == "info" else cache.clear()
+        else:
+            result = COMMANDS[namespace.command](_args_to_payload(namespace))
         print(json.dumps(_unwrap_result(result), ensure_ascii=False, indent=2, default=str))
         return 0
     except AnalysisError as exc:

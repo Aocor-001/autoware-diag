@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 
 from .core import _dictify, _open_mcap, _require_file_path, _truncate_text
 from .mcap_support import HAVE_ROS2
-from .errors import INTERNAL_ERROR, AnalysisError
+from .errors import INTERNAL_ERROR, INVALID_PARAMS, AnalysisError
 from .parsers import CUSTOM_MESSAGE_CATALOG
 
 def describe_message_schema(args: Dict) -> Dict:

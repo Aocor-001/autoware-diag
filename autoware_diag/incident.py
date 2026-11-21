@@ -1,10 +1,15 @@
 """Incident window investigation."""
 from __future__ import annotations
 
+import heapq
 import json
 import traceback
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+import re
 from collections import Counter, defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 from dateutil import parser as dateutil_parser
 
@@ -14,30 +19,19 @@ from .core import (
     _cap_snapshot_data,
     _decoding_status,
     _dictify,
-    _get_summary,
     _open_mcap,
-    _read_topic_timestamps,
     _require_file_path,
     _time_str,
-    _truncate_text,
 )
 from .mcap_support import HAVE_ROS2, Ros2DecoderFactory
-from .errors import INVALID_PARAMS, MAX_RESPONSE_CHARS, AnalysisError
+from .errors import INTERNAL_ERROR, INVALID_PARAMS, MAX_RESPONSE_CHARS, AnalysisError
 from .noise import _is_rosout_noise
 from .parsers import (
-    _AUTOWARE_STATE_LABELS,
-    _CONTROL_MODE_LABELS,
     _DIAG_LEVEL_LABELS,
-    _extract_control_summary,
     _extract_engage,
-    _extract_gate_mode,
-    _extract_scenario_summary,
-    _labelize,
     _parse_aeb_shadow,
-    _parse_pix_drive_fb,
     _reduce_diagnostics,
     _reduce_trajectory,
-    _val,
 )
 from .topics import (
     TOPIC_AEB,
@@ -51,15 +45,39 @@ from .topics import (
 )
 
 
-def _parse_time_value(val: Any, label: str = "time") -> int:
-    """Parse a time value (Unix seconds float or ISO string) to nanoseconds."""
-    if val is None:
-        raise AnalysisError(INVALID_PARAMS, f"Missing required parameter: {label}")
-    if isinstance(val, (int, float)):
-        return int(val * 1e9)
-    if isinstance(val, str):
-        return int(dateutil_parser.parse(val.strip()).timestamp() * 1e9)
-    raise AnalysisError(INVALID_PARAMS, f"Cannot parse {label}={val!r} (expected Unix seconds or ISO string)")
+def _seconds_to_ns(value: Any) -> int:
+    seconds = Decimal(str(value))
+    # MCAP timestamps are unsigned 64-bit nanoseconds. Also bound offsets so
+    # formatting/extreme exponents cannot cause overflow or unbounded allocation.
+    if not seconds.is_finite() or abs(seconds) > 2**64 / 1e9:
+        raise ValueError("seconds out of range")
+    return int(seconds * 1_000_000_000)
+
+
+def _parse_time_value(val: Any, label: str = "time", *, iso=False) -> int:
+    """Parse Unix seconds or ISO timestamps without a floating-point round trip."""
+    try:
+        if not iso:
+            try:
+                return _seconds_to_ns(val)
+            except InvalidOperation:
+                if not isinstance(val, str):
+                    raise
+        text = val.strip()
+        date = dateutil_parser.parse(text)
+        fraction = re.search(r"\d{2}:\d{2}:\d{2}[.,](\d+)", text)
+        nanos = int(fraction[1][:9].ljust(9, '0')) if fraction else date.microsecond * 1000
+        return int(date.replace(microsecond=0).timestamp()) * 1_000_000_000 + nanos
+    except (ValueError, InvalidOperation, OverflowError, OSError) as exc:
+        raise AnalysisError(INVALID_PARAMS, f"Cannot parse {label}={val!r} (expected Unix seconds or ISO string)") from exc
+
+
+def _window_iso(ns: int) -> str:
+    seconds, nanos = divmod(ns, 1_000_000_000)
+    local = datetime.fromtimestamp(seconds).astimezone()
+    if nanos % 1000 == 0:
+        return local.replace(microsecond=nanos // 1000).isoformat()
+    return local.strftime("%Y-%m-%dT%H:%M:%S") + f".{nanos:09d}" + local.isoformat()[19:]
 
 
 def investigate_incident(args: Dict) -> Dict:
@@ -78,11 +96,11 @@ def investigate_incident(args: Dict) -> Dict:
         # Time range mode — 直接取值，避免 args[key] 的 KeyError 风险
         ts_start_ns = _parse_time_value(
             args.get("start", args.get("start_iso")),
-            label="start/start_iso",
+            label="start/start_iso", iso="start" not in args,
         )
         ts_end_ns = _parse_time_value(
             args.get("end", args.get("end_iso")),
-            label="end/end_iso",
+            label="end/end_iso", iso="end" not in args,
         )
         if ts_end_ns <= ts_start_ns:
             raise AnalysisError(INVALID_PARAMS, "end must be after start")
@@ -91,13 +109,16 @@ def investigate_incident(args: Dict) -> Dict:
         # Single point mode
         ts_ns = _parse_time_value(
             args.get("timestamp", args.get("timestamp_iso")),
-            label="timestamp/timestamp_iso",
+            label="timestamp/timestamp_iso", iso="timestamp" not in args,
         )
-        window = args.get("window_seconds", 2.0)
-        if window <= 0:
+        try:
+            window_ns = _seconds_to_ns(args.get("window_seconds", 2))
+        except (ValueError, InvalidOperation) as exc:
+            raise AnalysisError(INVALID_PARAMS, "window_seconds must be a positive number") from exc
+        if window_ns <= 0:
             raise AnalysisError(INVALID_PARAMS, "window_seconds must be positive")
-        ts_start_ns = ts_ns - int(window * 1e9)
-        ts_end_ns = ts_ns + int(window * 1e9)
+        ts_start_ns = ts_ns - window_ns
+        ts_end_ns = ts_ns + window_ns
     else:
         raise AnalysisError(
             INVALID_PARAMS,
@@ -114,27 +135,107 @@ def investigate_incident(args: Dict) -> Dict:
         + ["/rosout", "/diagnostics"]
     ))
 
+    TL_PLANNING = [
+        "/planning/scenario_planning/trajectory",
+        "/planning/scenario_planning/lane_driving/trajectory",
+        "/planning/scenario_planning/scenario",
+        "/control/trajectory_follower/lateral/diagnostic",
+        "/control/trajectory_follower/longitudinal/diagnostic",
+    ]
+    TL_STATE = [
+        "/vehicle/status/velocity_status", "/vehicle/status/steering_status",
+        "/vehicle/status/actuation_status", "/control/command/control_cmd",
+        "/control/current_gate_mode", "/api/autoware/get/engage",
+    ]
+
+    alert_topics = set(TOPIC_AEB_SHADOW) | {
+        "/control/command/emergency_cmd", "/pix_robobus/av_aeb_ctrl",
+        "/api/autoware/get/engage", "/api/autoware/get/emergency",
+        "/control/current_gate_mode", "/control/command/control_cmd", "/diagnostics", "/rosout",
+    }
+    timeline_only = set(TL_PLANNING + TL_STATE) - alert_topics
+    closest_only = {}
+    timeline_candidates = defaultdict(list)
+    snapshot_needed = is_point and ts_ns is not None
+
     # Collect messages within the time window
     reader, fp = _open_mcap(file_path)
-    summary, ch_topic = _get_summary(reader)
 
     window_data: Dict[str, list] = defaultdict(list)
-    topic_counts: Counter = Counter()       # 窗口内真实消息数（不受精简影响）
-    topic_time_range: Dict[str, list] = {}  # 窗口内每话题 [min,max] log_time
-    file_first_log = None                   # 全文件时间范围（用于空窗口提示，
-    file_last_log = None                    #  避免二次读文件）
+    topic_counts: Counter = Counter()
+    topic_time_range: Dict[str, list] = {}
+    decode_failures: Counter = Counter()
+    decode_attempts: Counter = Counter()
+    decoder_functions = {}
+    file_first_log = file_last_log = None
+    file_range_source = None
+    messages_visited = 0
     decoder = Ros2DecoderFactory() if HAVE_ROS2 else None
+    selected = set(investigate_topics)
+
+    def decode_message(topic, schema, channel, msg):
+        lt = msg.log_time
+        decode_attempts[topic] += 1
+        decoded = None
+        if decoder and schema:
+            key = (channel.message_encoding, schema.id)
+            try:
+                if key not in decoder_functions:
+                    decoder_functions[key] = decoder.decoder_for(channel.message_encoding, schema)
+                if decoder_functions[key]:
+                    decoded = decoder_functions[key](msg.data)
+            except Exception:
+                pass
+        if decoded is None:
+            decode_failures[topic] += 1
+
+        # 大体消息内联精简，控制内存与 payload：
+        # - /diagnostics（可达数百 Hz × 上百 status）：只保留非 OK status，全 OK 不存储
+        # - 规划轨迹（数百个点）：只保留点数 + 首尾点
+        if topic == "/diagnostics":
+            reduced = _reduce_diagnostics(decoded)
+            if not reduced:
+                return None  # 计数已记录，无异常内容可存
+            data = {"non_ok_statuses": reduced}
+        elif topic in TOPIC_PLANNING_TRAJECTORY:
+            data = _reduce_trajectory(decoded)
+        else:
+            data = _dictify(decoded if decoded is not None else msg.data, max_depth=4)
+
+        return {
+            "publish_time_ns": msg.publish_time,
+            "publish_time_iso": _time_str(msg.publish_time),
+            "log_time_ns": lt,
+            "log_time_iso": _time_str(lt),
+            "data": data,
+        }
 
     try:
-        for _schema, channel, msg in reader.iter_messages(log_time_order=False, topics=investigate_topics):
+        summary = reader.get_summary()
+        indexed = bool(summary and summary.chunk_indexes)
+        stats = summary.statistics if summary else None
+        if stats and stats.message_count:
+            file_first_log, file_last_log = stats.message_start_time, stats.message_end_time
+            file_range_source = "summary_statistics"
+        elif indexed:
+            file_first_log = min(chunk.message_start_time for chunk in summary.chunk_indexes)
+            file_last_log = max(chunk.message_end_time for chunk in summary.chunk_indexes)
+            file_range_source = "summary_chunk_index"
+        collect_range = not indexed and stats is None
+        filters = {} if collect_range else {
+            "topics": selected, "start_time": ts_start_ns, "end_time": ts_end_ns + 1,
+        }
+        if collect_range:
+            file_range_source = "linear_scan"
+        for _schema, channel, msg in reader.iter_messages(log_time_order=False, **filters):
+            messages_visited += 1
             lt = msg.log_time
-            if file_first_log is None or lt < file_first_log:
-                file_first_log = lt
-            if file_last_log is None or lt > file_last_log:
-                file_last_log = lt
+            if collect_range:
+                file_first_log = lt if file_first_log is None else min(lt, file_first_log)
+                file_last_log = lt if file_last_log is None else max(lt, file_last_log)
 
-            topic = ch_topic.get(channel.id, "unknown") if channel else "unknown"
-            if topic not in investigate_topics:
+            topic = channel.topic
+            if topic not in selected:
                 continue
             # 使用 log_time（MCAP 记录时间）作为时间过滤依据，比 publish_time（节点时钟）更可靠
             if lt < ts_start_ns or lt > ts_end_ns:
@@ -150,43 +251,55 @@ def investigate_incident(args: Dict) -> Dict:
                 if lt > tr[1]:
                     tr[1] = lt
 
-            decoded = None
-            if decoder and _schema:
-                try:
-                    dec_fn = decoder.decoder_for(
-                        channel.message_encoding if channel else "cdr",
-                        _schema or None,
-                    )
-                    if dec_fn:
-                        decoded = dec_fn(msg.data)
-                except Exception:
-                    pass
+            if topic in alert_topics:
+                row = decode_message(topic, _schema, channel, msg)
+                if row is not None:
+                    window_data[topic].append(row)
+                continue
+            candidate = (_schema, channel, msg)
+            if snapshot_needed:
+                key = (abs(lt - ts_ns), lt, messages_visited)
+                previous = closest_only.get(topic)
+                if previous is None or key < previous[0]:
+                    closest_only[topic] = (key, candidate)
+            if topic in timeline_only:
+                # Keep the earliest 30 by log_time, even when on-disk order differs.
+                heap = timeline_candidates[topic]
+                item = (-lt, -messages_visited, candidate)
+                if len(heap) < 30:
+                    heapq.heappush(heap, item)
+                elif item[:2] > heap[0][:2]:
+                    heapq.heapreplace(heap, item)
 
-            # 大体消息内联精简，控制内存与 payload：
-            # - /diagnostics（可达数百 Hz × 上百 status）：只保留非 OK status，全 OK 不存储
-            # - 规划轨迹（数百个点）：只保留点数 + 首尾点
-            if topic == "/diagnostics":
-                reduced = _reduce_diagnostics(decoded)
-                if not reduced:
-                    continue  # 计数已记录，无异常内容可存
-                data = {"non_ok_statuses": reduced}
-            elif topic in TOPIC_PLANNING_TRAJECTORY:
-                data = _reduce_trajectory(decoded)
-            else:
-                data = _dictify(decoded if decoded is not None else msg.data, max_depth=4)
+        decoded_candidates = {}
+        def decode_candidate(topic, candidate):
+            key = id(candidate)
+            if key not in decoded_candidates:
+                decoded_candidates[key] = decode_message(topic, *candidate)
+            return decoded_candidates[key]
 
-            window_data[topic].append({
-                "publish_time_ns": msg.publish_time,
-                "publish_time_iso": _time_str(msg.publish_time),
-                "log_time_ns": lt,
-                "log_time_iso": _time_str(lt),
-                "data": data,
-            })
+        for topic, heap in timeline_candidates.items():
+            window_data[topic] = [decode_candidate(topic, item[2]) for item in sorted(heap, reverse=True)]
+        snapshots_only = {topic: decode_candidate(topic, item[1]) for topic, item in closest_only.items()}
     except Exception as e:
         log.error("investigate_incident: iter_messages failed: %s", traceback.format_exc())
         raise AnalysisError(INTERNAL_ERROR, f"Error reading messages from MCAP file: {e}")
     finally:
         fp.close()
+
+    file_range = None if file_first_log is None else {
+        "start_ns": file_first_log, "end_ns": file_last_log,
+        "start_iso": _window_iso(file_first_log), "end_iso": _window_iso(file_last_log),
+        "source": file_range_source,
+    }
+    scope = {
+        "mode": "indexed_window" if indexed else "linear_fallback",
+        "time_basis": "log_time", "complete": True, "message_iterations": 1,
+        "messages_visited": messages_visited, "decode_failures": dict(decode_failures),
+        "decode_attempts": sum(decode_attempts.values()),
+        "decode_scope": "All alert inputs; other payloads only for returned snapshot/timeline candidates.",
+        "file_time_range": file_range,
+    }
 
     # Sort each topic by log_time for temporal consistency
     for topic in window_data:
@@ -206,16 +319,18 @@ def investigate_incident(args: Dict) -> Dict:
             INVALID_PARAMS,
             f"No messages found in the specified time window.{file_range_info} "
             "Check that the timestamp is within the recording's time range.",
+            {"file_path": str(Path(file_path).resolve()), "scope": scope,
+             "start_ns": ts_start_ns, "end_ns": ts_end_ns},
         )
 
     # Point mode: snapshot (closest to target) — 基于全量数据，用 log_time 选最近
     snapshot = None
     if is_point and ts_ns is not None:
         snapshot = {}
-        for topic, msgs in window_data.items():
-            if not msgs:
-                continue
-            closest = min(msgs, key=lambda m: abs(m["log_time_ns"] - ts_ns))
+        snapshot_rows = {topic: min(msgs, key=lambda m: abs(m["log_time_ns"] - ts_ns))
+                         for topic, msgs in window_data.items() if topic in alert_topics and msgs}
+        snapshot_rows.update(snapshots_only)
+        for topic, closest in snapshot_rows.items():
             snapshot[topic] = {
                 "log_time_iso": closest["log_time_iso"],
                 "publish_time_iso": closest["publish_time_iso"],
@@ -247,15 +362,18 @@ def investigate_incident(args: Dict) -> Dict:
         if emg and prev_emg is not True:
             alerts.append({
                 "time": m["log_time_iso"],
+                "log_time_ns": m["log_time_ns"],
                 "topic": "/control/command/emergency_cmd",
                 "type": "emergency_command",
                 "severity": "error",
                 "detail": "Emergency control command activated"
                 + (" (already active at window start)" if prev_emg is None else ""),
+                "already_active_at_window_start": prev_emg is None,
             })
         elif not emg and prev_emg is True:
             alerts.append({
                 "time": m["log_time_iso"],
+                "log_time_ns": m["log_time_ns"],
                 "topic": "/control/command/emergency_cmd",
                 "type": "emergency_cleared",
                 "severity": "info",
@@ -275,27 +393,31 @@ def investigate_incident(args: Dict) -> Dict:
         if aeb and prev_aeb is not True:
             alerts.append({
                 "time": m["log_time_iso"],
+                "log_time_ns": m["log_time_ns"],
                 "topic": "/pix_robobus/av_aeb_ctrl",
                 "type": "aeb_active",
                 "severity": "error",
                 "detail": f"AEB active: brake_en={d.get('acu_aeb_brake_en')}, pedal_target={d.get('acu_aeb_brake_pedal_target')}"
                 + (" (already active at window start)" if prev_aeb is None else ""),
+                "already_active_at_window_start": prev_aeb is None,
             })
         if fcw and prev_fcw is not True:
             alerts.append({
                 "time": m["log_time_iso"],
+                "log_time_ns": m["log_time_ns"],
                 "topic": "/pix_robobus/av_aeb_ctrl",
                 "type": "fcw_active",
                 "severity": "warning",
                 "detail": "FCW active"
                 + (" (already active at window start)" if prev_fcw is None else ""),
+                "already_active_at_window_start": prev_fcw is None,
             })
         prev_aeb = aeb
         prev_fcw = fcw
 
     # AebInfoShadow（新版 AEB/FCW 反馈）— 跳变检测（以滤波后请求为准）
-    prev_shadow = {"aeb_req": None, "fcw_req": None, "aeb_fault": None, "fcw_fault": None}
     for shadow_t in TOPIC_AEB_SHADOW:
+        prev_shadow = {"aeb_req": None, "fcw_req": None, "aeb_fault": None, "fcw_fault": None}
         for m in window_data.get(shadow_t, []):
             d = m["data"]
             if not isinstance(d, dict):
@@ -309,24 +431,29 @@ def investigate_incident(args: Dict) -> Dict:
             if aeb_req and prev_shadow["aeb_req"] is not True:
                 alerts.append({
                     "time": m["log_time_iso"],
+                    "log_time_ns": m["log_time_ns"],
                     "topic": shadow_t,
                     "type": "aeb_request",
                     "severity": "error",
                     "detail": f"AEB request activated (filtered) [status={p['aeb_status_label']}]"
                     + (" (already active at window start)" if prev_shadow["aeb_req"] is None else ""),
+                    "already_active_at_window_start": prev_shadow["aeb_req"] is None,
                 })
             if fcw_req and prev_shadow["fcw_req"] is not True:
                 alerts.append({
                     "time": m["log_time_iso"],
+                    "log_time_ns": m["log_time_ns"],
                     "topic": shadow_t,
                     "type": "fcw_request",
                     "severity": "warning",
                     "detail": f"FCW request activated (filtered) [status={p['fcw_status_label']}]"
                     + (" (already active at window start)" if prev_shadow["fcw_req"] is None else ""),
+                    "already_active_at_window_start": prev_shadow["fcw_req"] is None,
                 })
             if aeb_status == 2 and prev_shadow["aeb_fault"] is not True:
                 alerts.append({
                     "time": m["log_time_iso"],
+                    "log_time_ns": m["log_time_ns"],
                     "topic": shadow_t,
                     "type": "aeb_fault",
                     "severity": "error",
@@ -336,6 +463,7 @@ def investigate_incident(args: Dict) -> Dict:
             if fcw_status == 2 and prev_shadow["fcw_fault"] is not True:
                 alerts.append({
                     "time": m["log_time_iso"],
+                    "log_time_ns": m["log_time_ns"],
                     "topic": shadow_t,
                     "type": "fcw_fault",
                     "severity": "error",
@@ -357,6 +485,7 @@ def investigate_incident(args: Dict) -> Dict:
         if engaged is False and prev_eng is not False:
             alerts.append({
                 "time": m["log_time_iso"],
+                "log_time_ns": m["log_time_ns"],
                 "topic": "/api/autoware/get/engage",
                 "type": "disengaged",
                 "severity": "error",
@@ -366,6 +495,7 @@ def investigate_incident(args: Dict) -> Dict:
         elif engaged is True and prev_eng is False:
             alerts.append({
                 "time": m["log_time_iso"],
+                "log_time_ns": m["log_time_ns"],
                 "topic": "/api/autoware/get/engage",
                 "type": "engaged",
                 "severity": "info",
@@ -383,6 +513,7 @@ def investigate_incident(args: Dict) -> Dict:
         if eflag and prev_eflag is not True:
             alerts.append({
                 "time": m["log_time_iso"],
+                "log_time_ns": m["log_time_ns"],
                 "topic": "/api/autoware/get/emergency",
                 "type": "emergency_flag",
                 "severity": "error",
@@ -399,6 +530,7 @@ def investigate_incident(args: Dict) -> Dict:
         if mode is not None and prev_gate is not None and mode != prev_gate:
             alerts.append({
                 "time": m["log_time_iso"],
+                "log_time_ns": m["log_time_ns"],
                 "topic": "/control/current_gate_mode",
                 "type": "gate_mode_change",
                 "severity": "info",
@@ -421,6 +553,7 @@ def investigate_incident(args: Dict) -> Dict:
         if steer is not None and prev_steer is not None and abs(steer - prev_steer) > 0.3:
             alerts.append({
                 "time": m["log_time_iso"],
+                "log_time_ns": m["log_time_ns"],
                 "topic": "/control/command/control_cmd",
                 "type": "abrupt_steering",
                 "severity": "warning",
@@ -439,13 +572,14 @@ def investigate_incident(args: Dict) -> Dict:
             if e:
                 e["count"] += 1
             else:
-                diag_seen[key] = {"first": m["log_time_iso"], "count": 1}
+                diag_seen[key] = {"first": m["log_time_iso"], "first_ns": m["log_time_ns"], "count": 1}
     for (name, level, message), e in sorted(
         diag_seen.items(), key=lambda kv: (-kv[0][1], kv[0][0])
     ):
         label = _DIAG_LEVEL_LABELS.get(level, f"LEVEL{level}")
         alerts.append({
             "time": e["first"],
+            "log_time_ns": e["first_ns"],
             "topic": "/diagnostics",
             "type": f"diagnostic_{label.lower()}",
             "severity": "error" if level >= 2 else "warning",
@@ -473,6 +607,7 @@ def investigate_incident(args: Dict) -> Dict:
             continue
         alerts.append({
             "time": m["log_time_iso"],
+            "log_time_ns": m["log_time_ns"],
             "topic": "/rosout",
             "type": "rosout_fatal" if level >= 50 else "rosout_error",
             "severity": "error" if level >= 50 else "warning",
@@ -499,27 +634,14 @@ def investigate_incident(args: Dict) -> Dict:
             "detail": f"{rosout_suppressed} more rosout error/fatal messages suppressed (cap 100)",
         })
 
-    # Deduplicate alerts (same time + same type)
+    # Deduplicate alerts by exact log time, not the rounded display time.
     seen_alerts = set()
     unique_alerts = []
     for a in alerts:
-        key = (a["time"], a["type"])
+        key = (a.get("log_time_ns"), a["type"])
         if key not in seen_alerts:
             seen_alerts.add(key)
             unique_alerts.append(a)
-
-    TL_PLANNING = [
-        "/planning/scenario_planning/trajectory",
-        "/planning/scenario_planning/lane_driving/trajectory",
-        "/planning/scenario_planning/scenario",
-        "/control/trajectory_follower/lateral/diagnostic",
-        "/control/trajectory_follower/longitudinal/diagnostic",
-    ]
-    TL_STATE = [
-        "/vehicle/status/velocity_status", "/vehicle/status/steering_status",
-        "/vehicle/status/actuation_status", "/control/command/control_cmd",
-        "/control/current_gate_mode", "/api/autoware/get/engage",
-    ]
 
     def _build_payload(tl_cap: int, snap_chars: int) -> Dict[str, Any]:
         # payload 截断只发生在这里（timeline 每话题最多 tl_cap 条；
@@ -546,10 +668,13 @@ def investigate_incident(args: Dict) -> Dict:
             }
         return {
             "mode": "range" if is_range else "point",
+            "file_path": str(Path(file_path).resolve()),
+            "scope": scope,
             "ros2_decoding": _decoding_status(),
             "time_range": {
-                "start_iso": _time_str(ts_start_ns),
-                "end_iso": _time_str(ts_end_ns),
+                "start_ns": ts_start_ns, "end_ns": ts_end_ns,
+                "start_iso": _window_iso(ts_start_ns),
+                "end_iso": _window_iso(ts_end_ns),
                 "duration_seconds": round((ts_end_ns - ts_start_ns) / 1e9, 2),
             },
             "snapshot": snapshot_payload,

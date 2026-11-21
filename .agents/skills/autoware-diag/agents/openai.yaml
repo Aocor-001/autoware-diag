@@ -1,0 +1,4 @@
+interface:
+  display_name: "Autoware MCAP 诊断"
+  short_description: "Analyze Pix Robobus / Autoware MCAP incidents"
+  default_prompt: "使用 $autoware-diag 分析我提供的 MCAP 录包，核对故障时段，并给出有话题、时间戳和来源文件支持的诊断结论。"

@@ -9,7 +9,7 @@ Diagnose Pix Robobus / Autoware MCAP recordings with the repository's local CLI.
 
 ## Hard rules
 
-1. **`file_path` must be real.** Never invent a path; ask for it when missing.
+1. **`file_path` must be real.** Resolve it from the cache convention below; ask only if missing or ambiguous.
 2. **Preserve the user's time.** Copy the user's timestamp, start, and end verbatim. Do not shift a supplied time. If an ISO time lacks an offset and timezone affects which recording or window is selected, ask which timezone it represents. After `investigate_incident`, verify returned `time_range`.
 3. **Check evidence availability before diagnosis.** Read `ros2_decoding`, topic/message counts, filters, and truncation fields such as `events_suppressed` before interpreting missing results. A decoder being enabled does not prove every message decoded.
 4. **State missing evidence precisely.** Use only the applicable wording:
@@ -24,24 +24,44 @@ Diagnose Pix Robobus / Autoware MCAP recordings with the repository's local CLI.
 8. **No pre-window blame.** Errors before a target range are independent unless their state is visibly continuous into that range; cite the continuous interval.
 9. **Bound incident windows.** Keep `window_seconds` at or below 30 seconds unless the user requests more.
 10. **On error, read the message.** Do not retry identical parameters.
-11. **Use the local CLI.** From the repository root, run `cd REPO/scripts && python3 autoware_diag.py <command> <file_path>`. Do not invent a path or silently replace the project CLI with ad-hoc parsing.
+11. **Use the local CLI.** Resolve `REPO` as described below, then run `python3 "REPO/scripts/autoware_diag.py" <command> "FILE"` with the actual paths substituted. Do not invent a path or silently replace the project CLI with ad-hoc parsing.
+
+## MCAP discovery convention
+
+When the user asks to inspect a bag without providing an absolute path, search `~/.pix-mcap-cache` first. This is the project's persistent local MCAP cache, organized by vehicle. The currently observed layout is `~/.pix-mcap-cache/pix-failcase-data/<vehicle>/<date>/Mcap/`. Use the actual path, but do not walk all vehicles or dates to verify this layout.
+
+The user will normally specify the vehicle and bag. Resolve only candidates under that cache root:
+
+1. Open the requested vehicle directory directly; if the date is known, open that date directory directly.
+2. Match the requested bag/name inside that scope (`Mcap/` first). Reuse any paths found in this task. Never recursively scan the cache root.
+3. If there is exactly one matching file, use its absolute path.
+4. If there are multiple matches, show the full candidate paths and ask which bag to inspect.
+5. If no match exists, report that the requested bag was not found in the cache and ask for a more precise vehicle/date/bag identifier. Do not invent a path, silently select another vehicle, or silently search another root.
+
+Always include the selected absolute MCAP path in the evidence/report. The cache lookup convention is project-specific and takes precedence over generic recording-path examples below.
 
 ## CLI command map
 
-Run commands from the repository root. Each command writes structured JSON to stdout and errors to stderr with a nonzero exit code.
+Codex discovers this skill directly at `.agents/skills/autoware-diag/SKILL.md`. Resolve the loaded `SKILL.md` path; `REPO` is the fourth parent of that file (`.agents/skills/autoware-diag/SKILL.md` → repository root). Confirm that `REPO/scripts/autoware_diag.py` exists. Do not assume the current working directory is the repository root: the project may be opened at its containing directory.
+
+If `REPO/.venv/bin/python` exists, use it instead of `python3` in all commands below so the CLI uses the project dependencies even when no environment is activated. Otherwise use `python3`. A missing dependency is a setup failure, not evidence about a recording; follow the README installation instructions rather than silently changing the analysis method.
+
+In the examples below, replace `REPO` and `FILE` with the actual repository and recording paths. Use the absolute CLI path so commands work from either directory; quote paths containing spaces. Each command writes structured JSON to stdout and errors to stderr with a nonzero exit code.
 
 | Intent | Command |
 |---|---|
-| Package structure | `cd REPO/scripts && python3 autoware_diag.py overview FILE` |
-| Node logs | `cd REPO/scripts && python3 autoware_diag.py rosout FILE` |
-| Diagnostics | `cd REPO/scripts && python3 autoware_diag.py diagnostics FILE` |
-| Vehicle health | `cd REPO/scripts && python3 autoware_diag.py health FILE` |
-| Gaps and frequency | `cd REPO/scripts && python3 autoware_diag.py anomalies FILE` |
-| Traffic lights | `cd REPO/scripts && python3 autoware_diag.py traffic-light FILE` |
-| Planning/control | `cd REPO/scripts && python3 autoware_diag.py planning-control FILE` |
+| Summary-only metadata / candidate time ranges | `inspect` (does not scan when Summary is unavailable) |
+| Default bag review | `triage` (use `--details` only when more examples would help) |
+| Detailed package structure | `python3 "REPO/scripts/autoware_diag.py" overview "FILE"` |
+| Node logs | `python3 "REPO/scripts/autoware_diag.py" rosout "FILE"` |
+| Diagnostics | `python3 "REPO/scripts/autoware_diag.py" diagnostics "FILE"` |
+| Vehicle health | `python3 "REPO/scripts/autoware_diag.py" health "FILE"` |
+| Gaps and frequency | `python3 "REPO/scripts/autoware_diag.py" anomalies "FILE"` |
+| Traffic lights | `python3 "REPO/scripts/autoware_diag.py" traffic-light "FILE"` |
+| Planning/control | `python3 "REPO/scripts/autoware_diag.py" planning-control "FILE"` |
 | Perception/chassis/localization | `perception`, `chassis`, `localization` |
 | AEB/MRM | `aeb`, `mrm` |
-| Incident window | `cd REPO/scripts && python3 autoware_diag.py incident FILE --timestamp-iso 'USER_TIME' --window-seconds 2` |
+| Incident window | `python3 "REPO/scripts/autoware_diag.py" incident "FILE" --timestamp-iso 'USER_TIME' --window-seconds 2` |
 | Topics and schemas | `topics`, `schema`, `custom-messages` |
 
 The CLI is local and does not require an MCP server or external service. Keep the JSON result as the evidence source and report command failures instead of treating them as missing recording data.
@@ -50,9 +70,9 @@ The CLI is local and does not require an MCP server or external service. Keep th
 
 Before any absence, health, or root-cause conclusion:
 
-1. Confirm the recording and relevant topic are present with `analyze_bag_overview` or `list_topics`.
+1. Reuse topic/window counts already returned by `triage` or `incident`. Use `inspect` or `topics` only if topic inventory is still needed.
 2. Check `ros2_decoding`. If it is disabled or reports an error, content-based event absence cannot be concluded.
-3. Check tool-specific scope and truncation. For example, `analyze_rosout` may report `events_suppressed`; an incident response may reduce timeline or snapshot entries to fit its response budget.
+3. Check tool-specific scope, `decode_failures`, omitted counts, and truncation. Cache hits describe the analyzed source identity; they do not prove ongoing access to the recording. For example, `analyze_rosout` may report `events_suppressed`; an incident response may reduce timeline or snapshot entries to fit its response budget.
 4. If evidence is incomplete, report the limitation first, then make only observations supported by the available result.
 
 ## Select a route by symptom
@@ -61,43 +81,23 @@ Use the user's symptom to minimize unrelated scans. Every next tool call must st
 
 | Symptom | Start with | Cross-check next |
 |---|---|---|
-| Hard brake / unexpected deceleration | `detect_aeb_events`, `detect_mrm_events`, `analyze_planning_control`, chassis feedback | Determine whether AEB/MRM, planned control, or manual takeover commanded it; then inspect its trigger evidence. |
-| Green but vehicle does not move | `analyze_traffic_light`, takeover/control state, `analyze_planning_control` | Match the same signal group and time; verify final traffic light state, stop/planning evidence, and whether control remained autonomous. |
+| Hard brake / unexpected deceleration | `aeb` or `mrm`, depending on the symptom | Determine whether AEB/MRM, planned control, or manual takeover commanded it; then inspect its trigger evidence. |
+| Green but vehicle does not move | `traffic-light` | Match the same signal group and time; verify final traffic light state, stop/planning evidence, and whether control remained autonomous. |
 | Cannot enter autonomous operation | engage, operation mode, gate mode, `analyze_diagnostics` | Identify the blocking condition and its associated diagnostic or module state. |
-| Steering abnormal | steering command and feedback via `analyze_chassis`, `analyze_planning_control` | Compare command versus feedback, then assess trajectory/curvature, localization, and communication status. |
+| Steering abnormal | steering command and feedback via `chassis` | Compare command versus feedback, then assess trajectory/curvature, localization, and communication status. |
 | Localization jump / instability | `analyze_localization`, relevant diagnostics | Check source consistency, timing, and downstream control/planning effects. |
 
-## Standard workflow
+## Default workflow
 
-Use this path when the symptom does not choose a narrower route:
-
-```text
-1. analyze_bag_overview     - map time range, namespaces, nodes, zero-message topics
-2. analyze_rosout           - node WARN/ERROR timeline and output completeness
-3. analyze_diagnostics      - hardware/status aggregation
-4. list_custom_messages + describe_message_schema - when Pix, AEB, or custom fields matter
-5. Deep-dive by domain      - perception / traffic_light / planning_control / chassis / localization
-6. detect_mrm_events / detect_aeb_events - when safety events are relevant
-7. investigate_incident     - planning, control, chassis, localization, AEB/MRM context at an exact time
-```
-
-**Fast path:** when the returned evidence already identifies a concrete gap, filtered AEB request, or planning-validator invalid flag, use `investigate_incident` with a 1-2 second window to collect context. Do not claim the window tool covers topics it does not return.
+- **Given a time and a single bag:** run `incident` directly. Do not run metadata or full-bag commands first. Pass the exact user time/range; never shift or enlarge it automatically. An initially active state is not a new trigger in the window.
+- **“Look at this bag,” no symptom/time:** run `triage` once. Summarize coverage, observed WARN/ERROR and diagnostic statuses, AEB/MRM, and the most useful next check. Zero observations with missing/undecoded evidence cannot exclude an event.
+- **Given a symptom without a time:** select a relevant module from the symptom table. Open another module only if it supplies missing discriminating evidence.
+- **Several candidate files for a time:** run `inspect` on those candidates and investigate only files whose `log_time` range covers the request. An unavailable Summary is unknown coverage, not an exclusion; do not launch silent full scans. Ask when candidates remain ambiguous.
+- Reuse JSON already returned in this task. Do not repeat identical calls, start parallel overlapping scans on one bag, or chain `overview → rosout → diagnostics → health → anomalies → aeb → mrm` by default.
 
 ## Traffic light / green-not-go route
 
-```text
-1. analyze_bag_overview
-   - map each supplied recording's actual time range; do not infer order from filenames.
-2. analyze_traffic_light
-   - obtain traffic-light chain evidence and final traffic_signals state.
-3. analyze_planning_control
-   - obtain planning/control evidence for stopping or releasing.
-4. analyze_rosout
-   - inspect TL fine-detector and takeover logs, including truncation.
-5. investigate_incident
-   - collect planning, control, chassis, localization, AEB/MRM, rosout, and diagnostics context at the user's exact time.
-6. Align results by timestamp and source tool.
-```
+If a timestamp is given, start with `incident` for window context. Otherwise start with `traffic-light` to check the recognition chain and final `traffic_signals`. Use `inspect` only to locate time across multiple candidate files. Add `planning-control` for missing stop/release evidence or `rosout` for missing fine-detector/takeover evidence; reuse what the earlier result already provides and align all evidence by timestamp and source.
 
 `investigate_incident` currently supplies surrounding planning/control context; it does **not** independently establish traffic-light state. Attribute signal-state evidence to `analyze_traffic_light`.
 
