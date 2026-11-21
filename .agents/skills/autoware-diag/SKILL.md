@@ -28,7 +28,7 @@ Diagnose Pix Robobus / Autoware MCAP recordings with the repository's local CLI.
 
 ## MCAP discovery convention
 
-When the user asks to inspect a bag without providing an absolute path, search `~/.pix-mcap-cache` first. This is the project's persistent local MCAP cache, organized by vehicle. The currently observed layout is `~/.pix-mcap-cache/pix-failcase-data/<vehicle>/<date>/Mcap/`. Use the actual path, but do not walk all vehicles or dates to verify this layout.
+When the user asks to inspect a bag without providing an absolute path, search `~/.pix-mcap-cache` in the current user’s home directory first. The usual vehicle-based layout is `~/.pix-mcap-cache/pix-failcase-data/<vehicle>/<date>/Mcap/`. Use the actual path, but do not walk all vehicles or dates to verify this layout.
 
 The user will normally specify the vehicle and bag. Resolve only candidates under that cache root:
 

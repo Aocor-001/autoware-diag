@@ -16,7 +16,7 @@ from .errors import AnalysisError, INVALID_PARAMS
 
 CACHE_VERSION = 1
 ANALYSIS_VERSION = 2  # Bump when evidence interpretation or aggregate semantics change.
-DEFAULT_CACHE_DIR = Path('~/.pix-mcap-cache/.autoware-diag-cache').expanduser()
+DEFAULT_CACHE_DIR = Path('~/.pix-mcap-cache/.autoware-diag-cache')
 MAX_BYTES = 256 * 1024 * 1024
 MAX_BAGS = 500
 MAX_ENTRY_BYTES = 1024 * 1024
@@ -53,7 +53,8 @@ def source_identity(file_path):
 class Cache:
     def __init__(self, directory=None, *, max_bytes=MAX_BYTES, max_bags=MAX_BAGS,
                  max_entry_bytes=MAX_ENTRY_BYTES):
-        self.directory = Path(directory or os.environ.get('AUTOWARE_DIAG_CACHE_DIR', DEFAULT_CACHE_DIR))
+        configured = directory or os.environ.get('AUTOWARE_DIAG_CACHE_DIR') or DEFAULT_CACHE_DIR
+        self.directory = Path(configured).expanduser()
         self.max_bytes = max_bytes
         self.max_bags = max_bags
         self.max_entry_bytes = max_entry_bytes

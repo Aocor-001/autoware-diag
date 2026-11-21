@@ -243,6 +243,13 @@ class PerformanceTests(unittest.TestCase):
         self.assertEqual(result['cache']['reason'], 'incomplete_evidence')
         self.assertEqual(Cache().info()['bags'], 0)
 
+    def test_cache_default_uses_current_home_and_respects_override(self):
+        with patch.dict(os.environ, {'HOME': str(self.root), 'AUTOWARE_DIAG_CACHE_DIR': ''}):
+            default = Cache().directory
+            self.assertEqual(default, self.root / '.pix-mcap-cache' / '.autoware-diag-cache')
+            self.assertFalse(default.exists())
+        self.assertEqual(Cache().directory, self.cache_dir)
+
     def test_cache_bypass_and_failure_still_analyze(self):
         with patch.object(Cache, '_lock', side_effect=PermissionError('cache directory not writable')) as lock:
             bypass = quick.triage_bag({**self.args, 'no_cache': True})
